@@ -5,14 +5,31 @@
 #![allow(dead_code)]
 #![no_std]
 
+mod register;
+mod com;
+mod error;
+mod types;
+mod utils;
+
 use embassy_sync::blocking_mutex::raw::RawMutex;
-use embassy_sync::mutex::{Mutex, MutexGuard};
+use embassy_sync::mutex::Mutex;
 #[cfg(not(feature = "async"))]
 use embedded_hal::i2c::I2c;
 #[cfg(feature = "async")]
 use embedded_hal_async::i2c::I2c;
-use I2cHolder::Direct;
-use crate::I2cHolder::ThroughMutex;
+
+use crate::com::Com;
+use crate::com::I2cHolder::{Direct, ThroughMutex};
+use crate::register::Register;
+use crate::types::{SeqStepEnables, SeqStepTimeouts, VcselPeriodType};
+use crate::utils::{
+    decode_timeout, decode_vcsel_period, encode_timeout,
+    timeout_mclks_to_microseconds, timeout_microseconds_to_mclks,
+};
+
+// Re-exports
+pub use crate::error::Error;
+pub use crate::types::{GpioFunctionality, GpioPolarity};
 
 const DEFAULT_ADDRESS: u8 = 0x29;
 
@@ -35,29 +52,6 @@ pub struct VL53L0x<'a, I2C: I2c, RM: RawMutex> {
     io_mode2v8: bool,
     stop_variable: u8,
     measurement_timing_budget_microseconds: u32,
-}
-
-/// MPU Error
-#[derive(Debug, Copy, Clone)]
-pub enum Error<E> {
-    /// WHO_AM_I returned invalid value (returned value is argument).
-    InvalidDevice(u8),
-    /// Underlying bus error.
-    BusError(E),
-    /// Timeout
-    Timeout,
-    /// I2C address not valid, needs to be between 0x08 and 0x77.
-    /// It is a 7 bit address thus the range is 0x00 - 0x7F but
-    /// 0x00 - 0x07 and 0x78 - 0x7F are reserved I2C addresses and cannot be used.
-    InvalidAddress(u8),
-    /// Invalid argument (e.g., threshold values out of range or low > high).
-    InvalidArgument,
-}
-
-impl<E> From<E> for Error<E> {
-    fn from(error: E) -> Self {
-        Error::BusError(error)
-    }
 }
 
 impl<'a, I2C, E, RM> VL53L0x<'a, I2C, RM>
@@ -897,324 +891,5 @@ where
     pub async fn clear_interrupt_status(&mut self) -> Result<(), E> {
         self.com.write_register(Register::SYSTEM_INTERRUPT_CLEAR, 0x01).await?;
         self.com.write_register(Register::SYSTEM_INTERRUPT_CLEAR, 0x00).await
-    }
-
-    /*
-        fn write_byte_raw(&mut self, reg: u8, byte: u8) {
-            // FIXME:
-            //  * remove this function
-            //  * device address is not a const
-            //  * register address is u16
-            let mut buffer = [0];
-            let _ = self.com.write_read(ADDRESS, &[reg, byte], &mut buffer);
-        }
-
-        fn read_byte_raw(&mut self, reg: u8) -> u8 {
-            // FIXME:
-            //  * remove this function
-            //  * device address is not a const
-            //  * register address is u16
-            let mut data: [u8; 1] = [0];
-            let _ = self.com.write_read(ADDRESS, &[reg], &mut data);
-            data[0]
-        }
-
-        fn write_byte(&mut self, reg: Register, byte: u8) {
-            let mut buffer = [0];
-            let _ = self
-                .com
-                .write_read(ADDRESS, &[reg as u8, byte], &mut buffer);
-        }
-    */
-}
-
-struct SeqStepEnables {
-    tcc: bool,
-    dss: bool,
-    msrc: bool,
-    pre_range: bool,
-    final_range: bool,
-}
-
-struct SeqStepTimeouts {
-    pre_range_vcselperiod_pclks: u8,
-    final_range_vcsel_period_pclks: u8,
-    msrc_dss_tcc_mclks: u8,
-    pre_range_mclks: u16,
-    final_range_mclks: u16,
-    msrc_dss_tcc_microseconds: u32,
-    pre_range_microseconds: u32,
-    final_range_microseconds: u32,
-}
-
-fn decode_timeout(register_value: u16) -> u16 {
-    // format: "(LSByte * 2^MSByte) + 1"
-    ((register_value & 0x00FF) << ((register_value & 0xFF00) >> 8)) + 1
-}
-
-fn encode_timeout(timeout_mclks: u16) -> u16 {
-    if timeout_mclks == 0 {
-        return 0;
-    }
-    let mut ls_byte: u32;
-    let mut ms_byte: u16 = 0;
-
-    ls_byte = (timeout_mclks as u32) - 1;
-
-    while (ls_byte & 0xFFFFFF00) > 0 {
-        ls_byte >>= 1;
-        ms_byte += 1;
-    }
-
-    (ms_byte << 8) | ((ls_byte & 0xFF) as u16)
-}
-
-fn calc_macro_period(vcsel_period_pclks: u8) -> u32 {
-    ((2304u32 * (vcsel_period_pclks as u32) * 1655u32) + 500u32) / 1000u32
-}
-
-fn timeout_mclks_to_microseconds(
-    timeout_period_mclks: u16,
-    vcsel_period_pclks: u8,
-) -> u32 {
-    let macro_period_nanoseconds: u32 = calc_macro_period(vcsel_period_pclks);
-    (((timeout_period_mclks as u32) * macro_period_nanoseconds)
-        + (macro_period_nanoseconds / 2))
-        / 1000
-}
-
-fn timeout_microseconds_to_mclks(
-    timeout_period_microseconds: u32,
-    vcsel_period_pclks: u8,
-) -> u32 {
-    let macro_period_nanoseconds: u32 = calc_macro_period(vcsel_period_pclks);
-
-    ((timeout_period_microseconds * 1000) + (macro_period_nanoseconds / 2))
-        / macro_period_nanoseconds
-}
-
-// Decode VCSEL (vertical cavity surface emitting laser) pulse period in PCLKs from register value based on VL53L0X_decode_vcsel_period()
-fn decode_vcsel_period(register_value: u8) -> u8 {
-    ((register_value) + 1) << 1
-}
-
-// Encode VCSEL pulse period register value from period in PCLKs based on VL53L0X_encode_vcsel_period()
-fn encode_vcsel_period(period_pclks: u8) -> u8 {
-    ((period_pclks) >> 1) - 1
-}
-
-#[allow(non_camel_case_types)]
-enum Register {
-    SYSRANGE_START = 0x00,
-    WHO_AM_I = 0xC0,
-    VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV = 0x89,
-    MSRC_CONFIG_CONTROL = 0x60,
-    SYSTEM_SEQUENCE_CONFIG = 0x01,
-    FINAL_RANGE_CONFIG_MIN_COUNT_RATE_RTN_LIMIT = 0x44,
-    GLOBAL_CONFIG_SPAD_ENABLES_REF_0 = 0xB0,
-    DYNAMIC_SPAD_REF_EN_START_OFFSET = 0x4F,
-    DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD = 0x4E,
-    GLOBAL_CONFIG_REF_EN_START_SELECT = 0xB6,
-    SYSTEM_INTERRUPT_CONFIG_GPIO = 0x0A,
-    GPIO_HV_MUX_ACTIVE_HIGH = 0x84,
-    SYSTEM_INTERRUPT_CLEAR = 0x0B,
-    RESULT_INTERRUPT_STATUS = 0x13,
-    RESULT_RANGE_STATUS = 0x14,
-    RESULT_RANGE_STATUS_plus_10 = 0x1e,
-    OSC_CALIBRATE_VAL = 0xF8,
-    SYSTEM_INTERMEASUREMENT_PERIOD = 0x04,
-    FINAL_RANGE_CONFIG_VCSEL_PERIOD = 0x70,
-    PRE_RANGE_CONFIG_VCSEL_PERIOD = 0x50,
-    PRE_RANGE_CONFIG_TIMEOUT_MACROP_HI = 0x51,
-    PRE_RANGE_CONFIG_TIMEOUT_MACROP_LO = 0x52,
-    FINAL_RANGE_CONFIG_TIMEOUT_MACROP_HI = 0x71,
-    FINAL_RANGE_CONFIG_TIMEOUT_MACROP_LO = 0x72,
-    CROSSTALK_COMPENSATION_PEAK_RATE_MCPS = 0x20,
-    MSRC_CONFIG_TIMEOUT_MACROP = 0x46,
-    I2C_SLAVE_DEVICE_ADDRESS = 0x8A,
-    SYSTEM_THRESH_HIGH = 0x0C,
-    SYSTEM_THRESH_LOW = 0x0E,
-}
-
-#[derive(Debug, Copy, Clone)]
-enum VcselPeriodType {
-    VcselPeriodPreRange = 0,
-    VcselPeriodFinalRange = 1,
-}
-
-/// Which event is routed to the GPIO pin.
-#[derive(Copy, Clone, Debug)]
-pub enum GpioFunctionality {
-    /// Interrupt on new sample ready (default after init)
-    NewSampleReady,
-    /// Interrupt on range below low threshold
-    LevelLow,
-    /// Interrupt on range above high threshold
-    LevelHigh,
-    /// Interrupt on range outside window (below low OR above high)
-    OutOfWindow,
-}
-
-/// Active level of the interrupt pin.
-#[derive(Copy, Clone, Debug)]
-pub enum GpioPolarity {
-    /// GPIO pulls low when interrupt occurs (default after init)
-    ActiveLow,
-    /// GPIO pulls high when interrupt occurs
-    ActiveHigh,
-}
-
-struct Com<'a, I2C: I2c, RM: RawMutex> {
-    address: u8,
-    i2c_holder: I2cHolder<'a, I2C, RM>,
-}
-
-enum I2cHolder<'a, I2C: I2c, RM: RawMutex> {
-    ThroughMutex(&'a Mutex<RM, I2C>),
-    Direct(&'a mut I2C),
-}
-
-enum ActiveI2c<'a, I2C: I2c, RM: RawMutex> {
-    Guarded(MutexGuard<'a, RM, I2C>),
-    Borrowed(&'a mut I2C),
-}
-
-impl<'a, I2C: I2c, RM: RawMutex> core::ops::Deref for ActiveI2c<'a, I2C, RM> {
-    type Target = I2C;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            ActiveI2c::Guarded(g) => &**g,
-            ActiveI2c::Borrowed(r) => r,
-        }
-    }
-}
-
-impl<'a, I2C: I2c, RM: RawMutex> core::ops::DerefMut for ActiveI2c<'a, I2C, RM> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            ActiveI2c::Guarded(g) => &mut **g,
-            ActiveI2c::Borrowed(r) => r,
-        }
-    }
-}
-
-impl<'a, I2C, RM: RawMutex, E> Com<'a, I2C, RM>
-where
-    I2C: I2c<Error = E>,
-    RM: RawMutex,
-{
-    async fn lock_i2c(&mut self) -> ActiveI2c<'_, I2C, RM> {
-        match &mut self.i2c_holder {
-            ThroughMutex(mutex) => ActiveI2c::Guarded(mutex.lock().await),
-            Direct(i2c) => ActiveI2c::Borrowed(i2c),
-        }
-    }
-
-    async fn read_register(&mut self, reg: Register) -> Result<u8, E> {
-        let address = self.address;
-        let mut data: [u8; 1] = [0];
-        // FIXME:
-        //  * device address is not a const
-        //  * register address is u16
-        let mut i2c = self.lock_i2c().await;
-        i2c!(i2c, write_read, address, &[reg as u8], &mut data)?;
-        Ok(data[0])
-    }
-
-    async fn read_byte(&mut self, reg: u8) -> Result<u8, E> {
-        let address = self.address;
-        let mut data: [u8; 1] = [0];
-        // FIXME:
-        //  * device address is not a const
-        //  * register address is u16
-        let mut i2c = self.lock_i2c().await;
-        i2c!(i2c, write_read, address, &[reg], &mut data)?;
-        Ok(data[0])
-    }
-
-    async fn read_6bytes(&mut self, reg: Register) -> Result<[u8; 6], E> {
-        let mut ret: [u8; 6] = Default::default();
-        self.read_registers(reg, &mut ret).await?;
-        Ok(ret)
-    }
-
-    async fn read_registers(
-        &mut self,
-        reg: Register,
-        buffer: &mut [u8],
-    ) -> Result<(), E> {
-        let address = self.address;
-        // const I2C_AUTO_INCREMENT: u8 = 1 << 7;
-        const I2C_AUTO_INCREMENT: u8 = 0;
-        let mut i2c = self.lock_i2c().await;
-        i2c!(i2c, write_read,
-            address,
-            &[(reg as u8) | I2C_AUTO_INCREMENT],
-            buffer
-        )?;
-        Ok(())
-    }
-
-    async fn read_16bit(&mut self, reg: Register) -> Result<u16, E> {
-        let mut buffer: [u8; 2] = [0, 0];
-        self.read_registers(reg, &mut buffer).await?;
-        Ok(((buffer[0] as u16) << 8) + (buffer[1] as u16))
-    }
-
-    async fn write_byte(&mut self, reg: u8, byte: u8) -> Result<(), E> {
-        let address = self.address;
-        let mut buffer = [0];
-        let mut i2c = self.lock_i2c().await;
-        i2c!(i2c, write_read, address, &[reg, byte], &mut buffer)?;
-        Ok(())
-    }
-
-    async fn write_register(&mut self, reg: Register, byte: u8) -> Result<(), E> {
-        let address = self.address;
-        let mut buffer = [0];
-        let mut i2c = self.lock_i2c().await;
-        i2c!(i2c, write_read, address, &[reg as u8, byte], &mut buffer)?;
-        Ok(())
-    }
-
-    async fn write_6bytes(&mut self, reg: Register, bytes: [u8; 6]) -> Result<(), E> {
-        let address = self.address;
-        let mut buf: [u8; 6] = [0, 0, 0, 0, 0, 0];
-        let mut i2c = self.lock_i2c().await;
-        i2c!(i2c, write_read,
-            address,
-            &[
-                reg as u8, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
-                bytes[5],
-            ],
-            &mut buf
-        )?;
-        Ok(())
-    }
-
-    async fn write_16bit(&mut self, reg: Register, word: u16) -> Result<(), E> {
-        let address = self.address;
-        let mut buffer = [0];
-        let msb = (word >> 8) as u8;
-        let lsb = (word & 0xFF) as u8;
-        let mut i2c = self.lock_i2c().await;
-        i2c!(i2c, write_read, address, &[reg as u8, msb, lsb], &mut buffer)?;
-        Ok(())
-    }
-
-    async fn write_32bit(&mut self, reg: Register, word: u32) -> Result<(), E> {
-        let address = self.address;
-        let mut buffer = [0];
-        let v1 = (word & 0xFF) as u8;
-        let v2 = ((word >> 8) & 0xFF) as u8;
-        let v3 = ((word >> 16) & 0xFF) as u8;
-        let v4 = ((word >> 24) & 0xFF) as u8;
-        let mut i2c = self.lock_i2c().await;
-        i2c!(i2c, write_read,
-            address,
-            &[reg as u8, v4, v3, v2, v1],
-            &mut buffer
-        )?;
-        Ok(())
     }
 }
