@@ -12,8 +12,10 @@ edition = "2018"
 
 [dependencies]
 nb = "1.1.0"
+embedded-hal = "1.0.0"
 embassy-sync = "0.7.2"
+embedded-hal-async = { version = "1.0.0", optional = true }
 
-[dependencies.hal]
-version = "1.0"
-package = "embedded-hal"
+[features]
+default = []
+async = ["dep:embedded-hal-async"]

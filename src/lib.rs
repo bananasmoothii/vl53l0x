@@ -6,12 +6,26 @@
 #![no_std]
 
 use embassy_sync::blocking_mutex::raw::RawMutex;
-use embassy_sync::mutex::Mutex;
-use hal::i2c::I2c;
+use embassy_sync::mutex::{Mutex, MutexGuard};
+#[cfg(not(feature = "async"))]
+use embedded_hal::i2c::I2c;
+#[cfg(feature = "async")]
+use embedded_hal_async::i2c::I2c;
 use I2cHolder::Direct;
 use crate::I2cHolder::ThroughMutex;
 
 const DEFAULT_ADDRESS: u8 = 0x29;
+
+macro_rules! i2c {
+    ($i2c:expr, $method:ident, $($args:expr),*) => {
+        {
+            #[cfg(not(feature = "async"))]
+            { $i2c.$method($($args),*) }
+            #[cfg(feature = "async")]
+            { $i2c.$method($($args),*).await }
+        }
+    }
+}
 
 /// dummy
 pub struct VL53L0x<'a, I2C: I2c, RM: RawMutex> {
@@ -40,7 +54,7 @@ pub enum Error<E> {
     InvalidArgument,
 }
 
-impl<E> core::convert::From<E> for Error<E> {
+impl<E> From<E> for Error<E> {
     fn from(error: E) -> Self {
         Error::BusError(error)
     }
@@ -52,7 +66,7 @@ where
     RM: RawMutex,
 {
     /// Creates new driver with default address.
-    pub async fn new(i2c: &'a mut Mutex<RM, I2C>) -> Result<VL53L0x<'a, I2C, RM>, Error<E>>
+    pub async fn new(i2c: &'a Mutex<RM, I2C>) -> Result<VL53L0x<'a, I2C, RM>, Error<E>>
     where
         I2C: I2c<Error = E>,
     {
@@ -60,7 +74,7 @@ where
     }
 
     /// Creates new driver with given address.
-    pub async fn with_address(i2c: &'a mut Mutex<RM, I2C>, address: u8) -> Result<VL53L0x<'a, I2C, RM>, Error<E>>
+    pub async fn with_address(i2c: &'a Mutex<RM, I2C>, address: u8) -> Result<VL53L0x<'a, I2C, RM>, Error<E>>
     where
         I2C: I2c<Error = E>,
     {
@@ -68,7 +82,7 @@ where
     }
 
     /// Creates new driver with given address. Optionally sets the address on the device.
-    pub async fn with_address_set(i2c: &'a mut Mutex<RM, I2C>, address: u8, set_device_address: bool) -> Result<VL53L0x<'a, I2C, RM>, Error<E>>
+    pub async fn with_address_set(i2c: &'a Mutex<RM, I2C>, address: u8, set_device_address: bool) -> Result<VL53L0x<'a, I2C, RM>, Error<E>>
     where
         I2C: I2c<Error = E>,
     {
@@ -136,10 +150,15 @@ where
         if !(0x08..=0x77).contains(&new_address) {
             return Err(Error::InvalidAddress(new_address));
         }
-        self.com.use_i2c(|i2c, address| i2c.write(
+        let address = self.com.address;
+        let mut i2c = self.com.lock_i2c().await;
+        i2c!(i2c, write,
             address,
             &[Register::I2C_SLAVE_DEVICE_ADDRESS as u8, new_address]
-        )).await?;
+        )?;
+
+        // self.com.address = new_address; // this is updated only if successful but 'i2c' holds borrow
+        drop(i2c);
         self.com.address = new_address;
 
         Ok(())
@@ -1051,8 +1070,32 @@ struct Com<'a, I2C: I2c, RM: RawMutex> {
 }
 
 enum I2cHolder<'a, I2C: I2c, RM: RawMutex> {
-    ThroughMutex(&'a mut Mutex<RM, I2C>),
+    ThroughMutex(&'a Mutex<RM, I2C>),
     Direct(&'a mut I2C),
+}
+
+enum ActiveI2c<'a, I2C: I2c, RM: RawMutex> {
+    Guarded(MutexGuard<'a, RM, I2C>),
+    Borrowed(&'a mut I2C),
+}
+
+impl<'a, I2C: I2c, RM: RawMutex> core::ops::Deref for ActiveI2c<'a, I2C, RM> {
+    type Target = I2C;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            ActiveI2c::Guarded(g) => &**g,
+            ActiveI2c::Borrowed(r) => r,
+        }
+    }
+}
+
+impl<'a, I2C: I2c, RM: RawMutex> core::ops::DerefMut for ActiveI2c<'a, I2C, RM> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            ActiveI2c::Guarded(g) => &mut **g,
+            ActiveI2c::Borrowed(r) => r,
+        }
+    }
 }
 
 impl<'a, I2C, RM: RawMutex, E> Com<'a, I2C, RM>
@@ -1060,36 +1103,33 @@ where
     I2C: I2c<Error = E>,
     RM: RawMutex,
 {
-    async fn use_i2c<T>(&mut self, f: impl FnOnce(&mut I2C, u8) -> T) -> T {
+    async fn lock_i2c(&mut self) -> ActiveI2c<'_, I2C, RM> {
         match &mut self.i2c_holder {
-            ThroughMutex(mutex) => {
-                let mut guard = mutex.lock().await;
-                f(&mut *guard, self.address)
-            },
-            Direct(i2c) => f(i2c, self.address),
+            ThroughMutex(mutex) => ActiveI2c::Guarded(mutex.lock().await),
+            Direct(i2c) => ActiveI2c::Borrowed(i2c),
         }
     }
 
     async fn read_register(&mut self, reg: Register) -> Result<u8, E> {
+        let address = self.address;
         let mut data: [u8; 1] = [0];
         // FIXME:
         //  * device address is not a const
         //  * register address is u16
-        self.use_i2c(|i2c, address| {
-            i2c.write_read(address, &[reg as u8], &mut data)?;
-            Ok(data[0])
-        }).await
+        let mut i2c = self.lock_i2c().await;
+        i2c!(i2c, write_read, address, &[reg as u8], &mut data)?;
+        Ok(data[0])
     }
 
     async fn read_byte(&mut self, reg: u8) -> Result<u8, E> {
+        let address = self.address;
         let mut data: [u8; 1] = [0];
         // FIXME:
         //  * device address is not a const
         //  * register address is u16
-        self.use_i2c(|i2c, address| {
-            i2c.write_read(address, &[reg], &mut data)?;
-            Ok(data[0])
-        }).await
+        let mut i2c = self.lock_i2c().await;
+        i2c!(i2c, write_read, address, &[reg], &mut data)?;
+        Ok(data[0])
     }
 
     async fn read_6bytes(&mut self, reg: Register) -> Result<[u8; 6], E> {
@@ -1103,15 +1143,16 @@ where
         reg: Register,
         buffer: &mut [u8],
     ) -> Result<(), E> {
+        let address = self.address;
         // const I2C_AUTO_INCREMENT: u8 = 1 << 7;
         const I2C_AUTO_INCREMENT: u8 = 0;
-        self.use_i2c(|i2c, address| {
-            i2c.write_read(
-                address,
-                &[(reg as u8) | I2C_AUTO_INCREMENT],
-                buffer,
-            )
-        }).await
+        let mut i2c = self.lock_i2c().await;
+        i2c!(i2c, write_read,
+            address,
+            &[(reg as u8) | I2C_AUTO_INCREMENT],
+            buffer
+        )?;
+        Ok(())
     }
 
     async fn read_16bit(&mut self, reg: Register) -> Result<u16, E> {
@@ -1121,54 +1162,59 @@ where
     }
 
     async fn write_byte(&mut self, reg: u8, byte: u8) -> Result<(), E> {
+        let address = self.address;
         let mut buffer = [0];
-        self.use_i2c(|i2c, address| {
-            i2c.write_read(address, &[reg, byte], &mut buffer)
-        }).await
+        let mut i2c = self.lock_i2c().await;
+        i2c!(i2c, write_read, address, &[reg, byte], &mut buffer)?;
+        Ok(())
     }
 
     async fn write_register(&mut self, reg: Register, byte: u8) -> Result<(), E> {
+        let address = self.address;
         let mut buffer = [0];
-        self.use_i2c(|i2c, address| {
-            i2c.write_read(address, &[reg as u8, byte], &mut buffer)
-        }).await
+        let mut i2c = self.lock_i2c().await;
+        i2c!(i2c, write_read, address, &[reg as u8, byte], &mut buffer)?;
+        Ok(())
     }
 
     async fn write_6bytes(&mut self, reg: Register, bytes: [u8; 6]) -> Result<(), E> {
+        let address = self.address;
         let mut buf: [u8; 6] = [0, 0, 0, 0, 0, 0];
-        self.use_i2c(|i2c, address| {
-            i2c.write_read(
-                address,
-                &[
-                    reg as u8, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
-                    bytes[5],
-                ],
-                &mut buf,
-            )
-        }).await
+        let mut i2c = self.lock_i2c().await;
+        i2c!(i2c, write_read,
+            address,
+            &[
+                reg as u8, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+                bytes[5],
+            ],
+            &mut buf
+        )?;
+        Ok(())
     }
 
     async fn write_16bit(&mut self, reg: Register, word: u16) -> Result<(), E> {
+        let address = self.address;
         let mut buffer = [0];
         let msb = (word >> 8) as u8;
         let lsb = (word & 0xFF) as u8;
-        self.use_i2c(|i2c, address| {
-            i2c.write_read(address, &[reg as u8, msb, lsb], &mut buffer)
-        }).await
+        let mut i2c = self.lock_i2c().await;
+        i2c!(i2c, write_read, address, &[reg as u8, msb, lsb], &mut buffer)?;
+        Ok(())
     }
 
     async fn write_32bit(&mut self, reg: Register, word: u32) -> Result<(), E> {
+        let address = self.address;
         let mut buffer = [0];
         let v1 = (word & 0xFF) as u8;
         let v2 = ((word >> 8) & 0xFF) as u8;
         let v3 = ((word >> 16) & 0xFF) as u8;
         let v4 = ((word >> 24) & 0xFF) as u8;
-        self.use_i2c(|i2c, address| {
-            i2c.write_read(
-                address,
-                &[reg as u8, v4, v3, v2, v1],
-                &mut buffer,
-            )
-        }).await
+        let mut i2c = self.lock_i2c().await;
+        i2c!(i2c, write_read,
+            address,
+            &[reg as u8, v4, v3, v2, v1],
+            &mut buffer
+        )?;
+        Ok(())
     }
 }
