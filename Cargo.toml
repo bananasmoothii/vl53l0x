@@ -11,7 +11,8 @@ version = "1.0.1"
 edition = "2018"
 
 [dependencies]
-nb = "0.1"
+nb = "1.1.0"
+embassy-sync = "0.7.2"
 
 [dependencies.hal]
 version = "1.0"
