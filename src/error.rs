@@ -1,5 +1,6 @@
 /// MPU Error
 #[derive(Debug, Copy, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error<E> {
     /// WHO_AM_I returned invalid value (returned value is argument).
     InvalidDevice(u8),
