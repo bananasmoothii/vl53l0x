@@ -1,18 +1,20 @@
 use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_sync::mutex::{Mutex, MutexGuard};
-#[cfg(not(feature = "async"))]
+#[cfg(not(feature = "async-hal"))]
 use embedded_hal::i2c::I2c;
-#[cfg(feature = "async")]
+#[cfg(feature = "async-hal")]
 use embedded_hal_async::i2c::I2c;
 
 use crate::register::Register;
 
+/// Helper for I2C communication, abstracting over the presence of a mutex and async/await.
+#[macro_export]
 macro_rules! i2c {
     ($i2c:expr, $method:ident, $($args:expr),*) => {
         {
-            #[cfg(not(feature = "async"))]
+            #[cfg(not(feature = "async-hal"))]
             { $i2c.$method($($args),*) }
-            #[cfg(feature = "async")]
+            #[cfg(feature = "async-hal")]
             { $i2c.$method($($args),*).await }
         }
     }
@@ -116,6 +118,7 @@ where
     }
 
     pub(crate) async fn write_byte(&mut self, reg: u8, byte: u8) -> Result<(), E> {
+        defmt::trace!("com write: reg={:#04x} byte={:#04x}", reg, byte);
         let address = self.address;
         let mut buffer = [0];
         let mut i2c = self.lock_i2c().await;
@@ -124,6 +127,7 @@ where
     }
 
     pub(crate) async fn write_register(&mut self, reg: Register, byte: u8) -> Result<(), E> {
+        defmt::trace!("com write: reg={:?} byte={:#04x}", reg, byte);
         let address = self.address;
         let mut buffer = [0];
         let mut i2c = self.lock_i2c().await;

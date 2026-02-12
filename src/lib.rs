@@ -13,9 +13,9 @@ mod utils;
 
 use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_sync::mutex::Mutex;
-#[cfg(not(feature = "async"))]
+#[cfg(not(feature = "async-hal"))]
 use embedded_hal::i2c::I2c;
-#[cfg(feature = "async")]
+#[cfg(feature = "async-hal")]
 use embedded_hal_async::i2c::I2c;
 
 use crate::com::Com;
@@ -32,17 +32,6 @@ pub use crate::error::Error;
 pub use crate::types::{GpioFunctionality, GpioPolarity};
 
 const DEFAULT_ADDRESS: u8 = 0x29;
-
-macro_rules! i2c {
-    ($i2c:expr, $method:ident, $($args:expr),*) => {
-        {
-            #[cfg(not(feature = "async"))]
-            { $i2c.$method($($args),*) }
-            #[cfg(feature = "async")]
-            { $i2c.$method($($args),*).await }
-        }
-    }
-}
 
 /// dummy
 pub struct VL53L0x<'a, I2C: I2c, RM: RawMutex> {
@@ -80,6 +69,9 @@ where
     where
         I2C: I2c<Error = E>,
     {
+        // locking the I2C bus during the initialization. This is useful when multiple sensors
+        // share the same bus and has almost no impact when only one sensor is used because then
+        // the use can use a NoopRawMutex.
         let mut guard = i2c.lock().await;
 
         let mut temp_chip: VL53L0x<'_, I2C, RM> = VL53L0x {
@@ -92,11 +84,13 @@ where
 
         let wai = temp_chip.who_am_i().await?;
         if wai == 0xEE {
-            // locking the I2C bus during the initialization. This is useful when multiple sensors
-            // share the same bus and has almost no impact when only one sensor is used because then
-            // the use can use a NoopRawMutex.
+            #[cfg(feature = "defmt")]
+            defmt::debug!("Initializing VL53L0X sensor with address 0x{:02X}", address);
 
             temp_chip.init_hardware().await?;
+
+            #[cfg(feature = "defmt")]
+            defmt::debug!("Hardware initialized");
 
             // FIXME: return an error/optional
             /*
@@ -371,6 +365,7 @@ where
             // set bit 0
             let ext_sup_hv = self.com
                 .read_register(Register::VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV).await?;
+            #[cfg(feature = "defmt")]
             self.com.write_register(
                 Register::VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV,
                 ext_sup_hv | 0x01,
@@ -694,7 +689,7 @@ where
         &mut self,
         budget_microseconds: u32,
     ) -> Result<bool, E> {
-        // note that these are different than values in get_
+        // note that these are different from values in get_
         let start_overhead: u32 = 1320;
         let end_overhead: u32 = 960;
         let msrc_overhead: u32 = 660;
@@ -780,8 +775,8 @@ where
     /// # fn test() -> Result<(), Error<()>> {
     /// # let i2c = unimplemented!(); // dummy_i2c();
     /// # let mut tof = VL53L0x::new(i2c)?;
-    /// tof.set_interrupt_thresholds_mm(100, 300)?; // 10cm to 30cm
-    /// let (lo, hi) = tof.get_interrupt_thresholds_mm()?;
+    /// tof.set_interrupt_thresholds_mm(100, 300).await?; // 10cm to 30cm
+    /// let (lo, hi) = tof.get_interrupt_thresholds_mm().await?;
     /// assert_eq!((lo, hi), (100, 300));
     /// # Ok(())
     /// # }

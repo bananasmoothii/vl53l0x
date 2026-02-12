@@ -1,5 +1,6 @@
 #![allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) enum Register {
     SYSRANGE_START = 0x00,
     WHO_AM_I = 0xC0,
