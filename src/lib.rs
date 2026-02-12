@@ -930,6 +930,75 @@ where
         self.write_register(Register::SYSTEM_INTERRUPT_CLEAR, 0x00)
     }
 
+    /// Convert raw range status register value to RangeStatus enum.
+    /// Based on STM VL53L0X API get_pal_range_status implementation.
+    fn parse_range_status(&self, raw_status: u8) -> RangeStatus {
+        // Extract device range status from bits 6:3 (bits 7-3 shifted right by 3)
+        let device_range_status = (raw_status & 0x78) >> 3;
+        
+        match device_range_status {
+            // Valid measurement cases (from STM reference implementation)
+            0 | 5 | 7 | 12 | 13 | 14 | 15 => RangeStatus::RangeValid,
+            // Hardware failure cases
+            1 | 2 | 3 => RangeStatus::HardwareFail,
+            // Phase failure cases  
+            6 | 9 => RangeStatus::PhaseFail,
+            // Min range / too close cases
+            8 | 10 => RangeStatus::MinRangeFail,
+            // Signal failure cases
+            4 => RangeStatus::SignalFail,
+            // Sigma failure cases
+            11 => RangeStatus::SigmaFail,
+            // Default case
+            _ => RangeStatus::None,
+        }
+    }
+
+    /// Read range measurement with status in blocking mode.
+    /// Returns (distance_mm, range_status) tuple.
+    /// 
+    /// This is perfect for tamper detection:
+    /// - SignalFail status = no object detected (box open)
+    /// - RangeValid status = object detected at measured distance (box closed)
+    /// 
+    /// # Example
+    /// ```no_run
+    /// # use vl53l0x::{VL53L0x, RangeStatus};
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let i2c = unimplemented!(); // your I2C implementation
+    /// let mut sensor = VL53L0x::new(i2c)?;
+    /// 
+    /// match sensor.get_range_with_status_blocking()? {
+    ///     (_, RangeStatus::SignalFail) => println!("Box is open - no object detected"),
+    ///     (distance, RangeStatus::RangeValid) => println!("Box closed - object at {}mm", distance),
+    ///     (_, status) => println!("Measurement issue: {:?}", status),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_range_with_status_blocking(&mut self) -> Result<(u16, RangeStatus), Error<E>> {
+        // Wait for measurement to complete
+        let mut c = 0;
+        while (self.read_register(Register::RESULT_INTERRUPT_STATUS)? & 0x07) == 0 {
+            c += 1;
+            if c == 10000 {
+                return Err(Error::Timeout);
+            }
+        }
+
+        // Read both the range measurement and status
+        let distance = self.read_16bit(Register::RESULT_RANGE_STATUS_plus_10)?;
+        let raw_status = self.read_register(Register::RESULT_RANGE_STATUS)?;
+        
+        // Clear the interrupt
+        self.clear_interrupt_status()?;
+        
+        // Parse the status
+        let status = self.parse_range_status(raw_status);
+        
+        Ok((distance, status))
+    }
+
     /*
         fn write_byte_raw(&mut self, reg: u8, byte: u8) {
             // FIXME:
@@ -1036,34 +1105,149 @@ fn encode_vcsel_period(period_pclks: u8) -> u8 {
 
 #[allow(non_camel_case_types)]
 enum Register {
+    /// System range start register - Controls measurement start/stop modes
+    /// Write 0x01: Single shot mode, 0x02: Continuous back-to-back, 0x04: Continuous timed
+    /// Reset: 0x00, Access: R/W
     SYSRANGE_START = 0x00,
+    
+    /// Device identification register - Returns device model ID
+    /// Should read 0xEE for VL53L0X, used for device verification
+    /// Reset: 0xEE, Access: RO
     WHO_AM_I = 0xC0,
+    
+    /// VHV config register - Controls I/O voltage level (1.8V/2.8V mode)
+    /// Bit 0: 0=1.8V mode, 1=2.8V mode for I2C pads
+    /// Reset: 0x00, Access: R/W
     VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV = 0x89,
+    
+    /// MSRC config control register - Controls signal rate limit checking
+    /// Used to disable/enable signal rate checks for MSRC and pre-range
+    /// Reset: 0x00, Access: R/W
     MSRC_CONFIG_CONTROL = 0x60,
+    
+    /// System sequence config register - Enables/disables measurement sequence steps
+    /// Bit 7: Final range, Bit 6: Pre-range, Bit 4: TCC, Bit 3: DSS, Bit 2: MSRC
+    /// Reset: 0xFF, Access: R/W
     SYSTEM_SEQUENCE_CONFIG = 0x01,
+    
+    /// Final range minimum signal rate limit register - Sets signal rate threshold
+    /// 16-bit value in 9.7 fixed point format (MCPS - Million Counts Per Second)
+    /// Reset: 0x0080, Access: R/W
     FINAL_RANGE_CONFIG_MIN_COUNT_RATE_RTN_LIMIT = 0x44,
+    
+    /// Global config SPAD enables reference 0 register - Reference SPAD selection
+    /// First of 6 registers (0xB0-0xB5) controlling which SPADs are used for reference
+    /// Reset: Device dependent, Access: R/W
     GLOBAL_CONFIG_SPAD_ENABLES_REF_0 = 0xB0,
+    
+    /// Dynamic SPAD reference enable start offset register
+    /// Controls starting position for dynamic SPAD reference selection
+    /// Reset: 0x00, Access: R/W
     DYNAMIC_SPAD_REF_EN_START_OFFSET = 0x4F,
+    
+    /// Dynamic SPAD number requested reference SPAD register
+    /// Sets number of reference SPADs to use (typically 0x2C = 44)
+    /// Reset: 0x2C, Access: R/W
     DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD = 0x4E,
+    
+    /// Global config reference enable start select register
+    /// Controls reference SPAD start selection parameters
+    /// Reset: 0xB4, Access: R/W
     GLOBAL_CONFIG_REF_EN_START_SELECT = 0xB6,
+    
+    /// System interrupt config GPIO register - Controls GPIO interrupt functionality
+    /// 0x01: Level low, 0x02: Level high, 0x03: Out of window, 0x04: New sample ready
+    /// Reset: 0x04, Access: R/W
     SYSTEM_INTERRUPT_CONFIG_GPIO = 0x0A,
+    
+    /// GPIO HV MUX active high register - Controls GPIO polarity and pin assignment
+    /// Bit 4: GPIO polarity (0=active low, 1=active high)
+    /// Reset: 0x00, Access: R/W
     GPIO_HV_MUX_ACTIVE_HIGH = 0x84,
+    
+    /// System interrupt clear register - Write to clear interrupt status
+    /// Write 0x01 then 0x00 to clear interrupt
+    /// Reset: 0x00, Access: W
     SYSTEM_INTERRUPT_CLEAR = 0x0B,
+    
+    /// Result interrupt status register - Indicates measurement completion
+    /// Bit 2-0: Error status, used to check if new measurement is ready
+    /// Reset: 0x00, Access: RO
     RESULT_INTERRUPT_STATUS = 0x13,
+    
+    /// Result range status register - Contains measurement status and error codes
+    /// Provides range validity, signal/ambient rates, error conditions
+    /// Reset: 0x00, Access: RO  
     RESULT_RANGE_STATUS = 0x14,
+    
+    /// Result range status + 10 register - Range measurement result in mm
+    /// 16-bit distance measurement result at offset 0x1E (0x14 + 10)
+    /// Reset: 0x0000, Access: RO
     RESULT_RANGE_STATUS_plus_10 = 0x1e,
+    
+    /// Oscillator calibrate value register - Internal oscillator calibration
+    /// Used for timing calculations and intermeasurement period scaling
+    /// Reset: Device dependent, Access: RO
     OSC_CALIBRATE_VAL = 0xF8,
+    
+    /// System intermeasurement period register - Controls timing between measurements
+    /// 32-bit value for continuous timed mode measurement interval
+    /// Reset: 0x00000000, Access: R/W
     SYSTEM_INTERMEASUREMENT_PERIOD = 0x04,
+    
+    /// Final range config VCSEL period register - VCSEL pulse period for final range
+    /// Controls laser pulse timing for final ranging measurement
+    /// Reset: 0x0E, Access: R/W
     FINAL_RANGE_CONFIG_VCSEL_PERIOD = 0x70,
+    
+    /// Pre-range config VCSEL period register - VCSEL pulse period for pre-range  
+    /// Controls laser pulse timing for pre-range measurement
+    /// Reset: 0x0C, Access: R/W
     PRE_RANGE_CONFIG_VCSEL_PERIOD = 0x50,
+    
+    /// Pre-range config timeout MACROP high register - Pre-range timeout (MSB)
+    /// Upper 8 bits of pre-range measurement timeout value
+    /// Reset: 0x00, Access: R/W
     PRE_RANGE_CONFIG_TIMEOUT_MACROP_HI = 0x51,
+    
+    /// Pre-range config timeout MACROP low register - Pre-range timeout (LSB)
+    /// Lower 8 bits of pre-range measurement timeout value
+    /// Reset: 0x96, Access: R/W
     PRE_RANGE_CONFIG_TIMEOUT_MACROP_LO = 0x52,
+    
+    /// Final range config timeout MACROP high register - Final range timeout (MSB)
+    /// Upper 8 bits of final range measurement timeout value
+    /// Reset: 0x00, Access: R/W
     FINAL_RANGE_CONFIG_TIMEOUT_MACROP_HI = 0x71,
+    
+    /// Final range config timeout MACROP low register - Final range timeout (LSB)
+    /// Lower 8 bits of final range measurement timeout value  
+    /// Reset: 0xFE, Access: R/W
     FINAL_RANGE_CONFIG_TIMEOUT_MACROP_LO = 0x72,
+    
+    /// Crosstalk compensation peak rate MCPS register - Crosstalk calibration value
+    /// 16-bit crosstalk compensation rate in 9.7 fixed point format
+    /// Reset: 0x0000, Access: R/W
     CROSSTALK_COMPENSATION_PEAK_RATE_MCPS = 0x20,
+    
+    /// MSRC config timeout MACROP register - MSRC/TCC/DSS timeout value
+    /// Single byte timeout value for MSRC, TCC, and DSS measurements
+    /// Reset: 0x08, Access: R/W
     MSRC_CONFIG_TIMEOUT_MACROP = 0x46,
+    
+    /// I2C slave device address register - Device I2C address (7-bit)
+    /// Write new I2C address (0x08-0x77), takes effect immediately
+    /// Reset: 0x29, Access: R/W
     I2C_SLAVE_DEVICE_ADDRESS = 0x8A,
+    
+    /// System threshold high register - Upper distance threshold for interrupts
+    /// 16-bit threshold in mm for window-based interrupt generation
+    /// Reset: 0x0000, Access: R/W
     SYSTEM_THRESH_HIGH = 0x0C,
+    
+    /// System threshold low register - Lower distance threshold for interrupts  
+    /// 16-bit threshold in mm for window-based interrupt generation
+    /// Reset: 0x0000, Access: R/W
     SYSTEM_THRESH_LOW = 0x0E,
 }
 
@@ -1093,4 +1277,24 @@ pub enum GpioPolarity {
     ActiveLow,
     /// GPIO pulls high when interrupt occurs
     ActiveHigh,
+}
+
+/// Range measurement status codes from VL53L0X.
+/// Based on official STM VL53L0X API implementation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RangeStatus {
+    /// Range measurement is valid - object detected at measured distance
+    RangeValid = 0,
+    /// Sigma estimate (measurement uncertainty) too high - measurement unreliable
+    SigmaFail = 1,
+    /// Signal rate too low - likely no object detected or object very far away
+    SignalFail = 2,
+    /// Object detected but too close (below minimum detection range ~30mm)
+    MinRangeFail = 3,
+    /// Phase check failed - measurement timing issue, data unreliable
+    PhaseFail = 4,
+    /// Hardware fault detected in sensor
+    HardwareFail = 5,
+    /// No measurement available or unknown status
+    None = 255,
 }
