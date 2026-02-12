@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 #![no_std]
 
-use hal::i2c::I2c;
+use embedded_hal::i2c::I2c;
 
 const DEFAULT_ADDRESS: u8 = 0x29;
 
@@ -22,6 +22,7 @@ pub struct VL53L0x<I2C: I2c> {
 
 /// MPU Error
 #[derive(Debug, Copy, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error<E> {
     /// WHO_AM_I returned invalid value (returned value is argument).
     InvalidDevice(u8),
