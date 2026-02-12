@@ -1282,6 +1282,7 @@ pub enum GpioPolarity {
 /// Range measurement status codes from VL53L0X.
 /// Based on official STM VL53L0X API implementation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RangeStatus {
     /// Range measurement is valid - object detected at measured distance
     RangeValid = 0,
