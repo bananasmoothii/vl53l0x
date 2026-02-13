@@ -932,13 +932,20 @@ where
 
     /// Convert raw range status register value to RangeStatus enum.
     /// Based on STM VL53L0X API get_pal_range_status implementation.
+    ///
+    /// Note: This is a simplified implementation. The official STM API performs
+    /// additional calculations to determine SigmaFail (measurement uncertainty too high),
+    /// which requires reading signal/ambient rates and computing sigma estimates.
+    /// This simplified version cannot detect SigmaFail and will return RangeValid instead.
     fn parse_range_status(&self, raw_status: u8) -> RangeStatus {
         // Extract device range status from bits 6:3 (bits 7-3 shifted right by 3)
         let device_range_status = (raw_status & 0x78) >> 3;
         
         match device_range_status {
             // Valid measurement cases (from STM reference implementation)
-            0 | 5 | 7 | 12 | 13 | 14 | 15 => RangeStatus::RangeValid,
+            // Note: 11 is included here - it indicates a valid range, not a sigma failure
+            // True sigma failures require additional calculations not performed here
+            0 | 5 | 7 | 11 | 12 | 13 | 14 | 15 => RangeStatus::RangeValid,
             // Hardware failure cases
             1 | 2 | 3 => RangeStatus::HardwareFail,
             // Phase failure cases  
@@ -947,9 +954,7 @@ where
             8 | 10 => RangeStatus::MinRangeFail,
             // Signal failure cases
             4 => RangeStatus::SignalFail,
-            // Sigma failure cases
-            11 => RangeStatus::SigmaFail,
-            // Default case
+            // Unknown device range status
             _ => RangeStatus::None,
         }
     }
@@ -1286,7 +1291,10 @@ pub enum GpioPolarity {
 pub enum RangeStatus {
     /// Range measurement is valid - object detected at measured distance
     RangeValid = 0,
-    /// Sigma estimate (measurement uncertainty) too high - measurement unreliable
+    /// Sigma estimate (measurement uncertainty) too high - measurement unreliable.
+    /// **Note:** This status cannot be accurately determined by the current simplified
+    /// implementation. Measurements that would be SigmaFail in the official API
+    /// will be reported as RangeValid instead.
     SigmaFail = 1,
     /// Signal rate too low - likely no object detected or object very far away
     SignalFail = 2,
