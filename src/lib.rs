@@ -11,7 +11,8 @@ const DEFAULT_ADDRESS: u8 = 0x29;
 
 /// dummy
 pub struct VL53L0x<I2C: I2c> {
-    com: I2C,
+    /// I2C communication interface
+    pub com: I2C,
     /// dummy
     pub revision_id: u8,
     io_mode2v8: bool,
